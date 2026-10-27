@@ -1,7 +1,84 @@
 // Rostyslav Hrabenko 260ADB166
 // https://github.com/mintyross/GradedLab-C
 // Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
-// Resources used: <every AI tool, website and book you used; details in comments where you used them>
+// Resources used: <https://duck.ai/share/17adb4cc-e97d-4d85-a6e3-680497212a24#ZFlq4VX5J11Gp2hJt1vgEDlLn70pIZKZpAHHL-KmA0s>
+//                 <https://stackoverflow.com/questions/14472680/how-to-get-and-evaluate-the-expressions-from-a-string-in-c>
+//                 <https://stackoverflow.com/questions/13498233/effective-methods-for-reading-and-writing-large-files-in-c>
+//                 <https://learnxbyexample.com/c/file-paths/>
+
+// 101 on Arithmetic Parsers in C
+/*
+This project made me pop.
+Every time people pass me by at the university, they constantly ask me how this Parser works.
+I've got tired explaining every condition of my tokenizer to all them people,
+that's why I wrote this cachy guide. Let's get to it.
+
+    How your tokenizer tracks positions?
+    > My tokenizer tracks characters using absolute linear positioning rather than
+      tracking lines, what I was trying to achieve before (poor boy).
+
+      - Before scanning a token, the tokenizer sets t.pos = global_idx + 1
+        to make it more convenient for humans to read (and obeys the given rules).
+
+      - When skipping spaces, tabs, or comments, global_idx++ advances
+        character-by-character. Every \n preserves its position in the index count.
+
+      - When a multi-character token (like an integer or **) is parsed,
+        global_idx moves to the end of the text match.
+        The starting point (t.pos) is locked onto the token structure,
+        while t.end_pos marks where it finishes.
+
+    Why your grammar gives the right precedence, and why ** is right-associative?
+    > The code uses a Pratt Parser (Top-Down Operator Precedence), which determines
+      how expressions bind together by assigning precedence numbers to tokens.
+
+      - The parser takes operators and operands to the right only if the next
+        operator's precedence is greater than or equal to min_prec.
+
+      - For left-associative operations, the parser increments the binding threshold
+        by calling parse_expression(prec + 1) for the right-hand operand.
+        This forces an expression like 4 + 5 + 6 to evaluate as (4 + 5) + 6,
+        because the second + cannot bind to 5 before the first one finishes.
+
+      - To make the power operator evaluate from right to left ((2**3**2 = 2**9 = 512),
+        the parser calls parse_expression(prec) without adding 1. This keeps the
+        binding threshold low, allowing the right-hand side to take subsequent
+        operators first before evaluating the left side.
+
+    Why each error is reported at the position you chose?
+    > Errors are reported exactly at the start of the token the parser was
+      analyzing when validation failed. The logic is extremely simple:
+      you see a mistake - you report it.
+
+    How you decide between integer and float arithmetic?
+    > The evaluation engine checks the types of the operands at runtime using a dynamic type system:
+      - If both operands have a type of VAL_INT, the calculation uses long long. This ensures
+        that integer operations have no floating-point rounding errors.
+      - If either operand is a VAL_FLOAT, the program turns both operands to double.
+      - Integer powers use bitwise squaring loop to maintain integer precision.
+        Float powers defer safely to the standard pow() function.
+
+    How you handle large files without slowing down (no repeated copying)?
+
+    > Instead of reading the file line-by-line using fgets, which as I now know requires repeatedly
+      copying data into small string arrays and risks cutting off long lines, the program loads
+      the entire file into a memory buffer at startup.
+
+    > The tokenizer does not allocate new string copies for every single token it encounters.
+      It maintains a single global Token structure, updating its type, numeric value,
+      and character coordinates in place as it moves through the buffer.
+
+    > The parser moves forward through the file sequentially without backtracking.
+      It calculates mathematical results on the fly, keeping memory overhead
+      minimal regardless of file size.
+
+That's it. You're on your own now.
+
+May the force of code comments be with you.
+
+*/
+
+// Used libraries =======
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,20 +86,28 @@
 #include <string.h>
 #include <math.h>
 #include <errno.h>
-#include <ctype.h>    // Character classification functions (isdigit, isalpha, etc.)
-#include <sys/stat.h> // File system attributes, sizing, and directory creation verification
-#include <dirent.h>   // Directory stream opening and reading utilities (DIR, readdir)
+#include <ctype.h>     // Character classification functions (isdigit, isalpha, etc.)
+#include <sys/stat.h>  // File system attributes, sizing, and directory creation verification
+#include <dirent.h>    // Directory stream opening and reading utilities (DIR, readdir)
 
 #ifdef _WIN32
 #include <direct.h>
 #define mkdir(A, B) _mkdir(A)
 #endif
 
-#define STUDENT_SUFFIX "anna_221234"              // used for folder name
-#define STUDENT_FULL_SUFFIX "anna_berzina_221234" // used for file name
-#define MAX_PATH 1024                             // maximum destination path length
-#define LINE_LEN 256                              // maximum line read length used for capping the reading buffer
+// Default values =======
 
+#define STUDENT_SUFFIX "rostyslav_260166"               // used for folder name
+#define STUDENT_FULL_SUFFIX "rostyslav_hrabenko_260166" // used for file name
+#define MAX_PATH 1024                                   // maximum destination path length
+
+// AI (Claude Haiku 4.5): prompt "I don't fully understand how expression tokenizers really work. I need to write a C program to analyze expression from a file and evaluate it. I'm really interested into making one of my own. Explain in-deep with examples."
+// Link: https://duck.ai/share/17adb4cc-e97d-4d85-a6e3-680497212a24#ZFlq4VX5J11Gp2hJt1vgEDlLn70pIZKZpAHHL-KmA0s
+//   Took the base idea with some snippets. Modified them for floating-point numbers and error handling.
+
+// Data types =======
+
+// Defining all the token types
 typedef enum
 {
     TOKEN_EOF,
@@ -63,9 +148,15 @@ typedef struct
     long long end_pos; // position immediately after token
 } Token;
 
-// Global parsing/tracking states
+// Global parsing/tracking states =======
+
+// Used for file storage
 const char *file_buf = NULL;
+
+// File length
 long long file_len = 0;
+
+// Determines which character is being processed
 long long global_idx = 0; // 0-based offset in file_buf
 
 // Output buffering structures to satisfy "All-or-nothing" error requirement
@@ -78,6 +169,7 @@ OutputLine *recorded_outputs = NULL;
 int output_count = 0;
 int output_capacity = 0;
 
+// dynamically grows a resizable array by doubling its capacity whenever it fills up
 void record_output(Value v)
 {
     if (output_count >= output_capacity)
@@ -88,9 +180,15 @@ void record_output(Value v)
     recorded_outputs[output_count++].val = v;
 }
 
-// Forward Declarations for Recursive Descent Parser
+// Forward Declarations for Recursive Descent Parser =======
+
+// Returns the next parsed syntax token from the input stream
 Token get_next_token(void);
+
+// Parses an expression using operator precedence climbing
 Value parse_expression(int min_prec);
+
+// Parses the highest-precedence basic building blocks of an expression
 Value parse_primary(void);
 
 // Global token lookahead
@@ -98,6 +196,7 @@ Token current_token;
 int has_error = 0;
 long long error_pos = 0;
 
+// Flags the very first error encountered and logs its code position
 void trigger_error(long long pos)
 {
     if (!has_error)
@@ -107,7 +206,11 @@ void trigger_error(long long pos)
     }
 }
 
-// Lexer / Tokenizer Implementation
+// Tokenizer Implementation
+/*
+    Tokenizers read buffers character-by-character to extract mathematical tokens,
+    filter out whitespace or comments, and enforce strict syntax formatting rules
+*/
 Token get_next_token(void)
 {
     Token t;
@@ -158,13 +261,14 @@ Token get_next_token(void)
 
     if (global_idx >= file_len)
     {
-        t.type = TOKEN_EOF;
+        t.type = TOKEN_EOF; // Hit the End Of File
         t.end_pos = t.pos;
         return t;
     }
 
-    char c = file_buf[global_idx];
+    char c = file_buf[global_idx]; // writes character to the buffer
 
+    // Determining the character type
     if (c == '\n')
     {
         t.type = TOKEN_EOL;
@@ -191,12 +295,12 @@ Token get_next_token(void)
         global_idx++;
         if (global_idx < file_len && file_buf[global_idx] == '*')
         {
-            t.type = TOKEN_POW;
+            t.type = TOKEN_POW; // If there are two asterics, token is power
             global_idx++;
         }
         else
         {
-            t.type = TOKEN_MUL;
+            t.type = TOKEN_MUL; // Otherwise, token is multiplication
         }
         t.end_pos = global_idx + 1;
         return t;
@@ -279,11 +383,19 @@ Token get_next_token(void)
             return t;
         }
 
+        // Calculates the total length of the extracted number string in bytes
         long long len = global_idx - start;
+
+        // Allocates a temporary heap buffer
         char *num_str = malloc(len + 1);
+
+        // Copies len bytes from the source file buffer into the newly allocated memory.
         memcpy(num_str, &file_buf[start], len);
+
+        // End the buffer with null-terminator
         num_str[len] = '\0';
 
+        // Determining token value type for memory optimization and formatting purposes
         if (has_dot)
         {
             t.type = TOKEN_FLOAT;
@@ -309,6 +421,16 @@ Token get_next_token(void)
 }
 
 // Parser Precedence Bindings
+
+/*
+    Sources:
+    "https://stackoverflow.com/questions/14472680/how-to-get-and-evaluate-the-expressions-from-a-string-in-c"
+    "https://stackoverflow.com/questions/13498233/effective-methods-for-reading-and-writing-large-files-in-c"
+    Learned more about parsers, tokenizers and how to make them work with large files in C.
+*/
+
+// Defines the order of operations for mathematical operators
+// by assigning them numerical priority levels
 int get_tok_precedence(TokenType type)
 {
     switch (type)
@@ -327,10 +449,14 @@ int get_tok_precedence(TokenType type)
 }
 
 // Pratt Parser / Recursive Descent Engine
+/*
+    Parses the base components of an expression, handling standalone values,
+    parenthesized groupings, and missing or misplaced operands.
+*/
 Value parse_primary()
 {
     Value res = {VAL_INT, {0}};
-    if (has_error)
+    if (has_error) // Exit on global error
         return res;
 
     if (current_token.type == TOKEN_INT || current_token.type == TOKEN_FLOAT)
@@ -367,16 +493,26 @@ Value parse_primary()
     return res;
 }
 
+/*
+    Evaluates mathematical expressions using precedence climbing while handling operators,
+    type promotions, and runtime math errors.
+
+    It parses a left-hand value, hooks into a loop to continuously consume operators
+    that meet the minimum precedence threshold (min_prec), computes the right-hand value,
+    and immediately executes the math operation.
+ */
 Value parse_expression(int min_prec)
 {
+    // Parses the leftmost operand before entering the evaluation loop
     Value lhs = parse_primary();
-    if (has_error)
+
+    if (has_error) // Exit on global error
         return lhs;
 
     while (1)
     {
         int prec = get_tok_precedence(current_token.type);
-        if (prec < min_prec)
+        if (prec < min_prec) // Used to keep the order of mathematical operations
             break;
 
         TokenType op = current_token.type;
@@ -397,6 +533,7 @@ Value parse_expression(int min_prec)
         long long rhs_pos = current_token.pos;
         // Right-associative handling for power exponent calculations
         int next_min_prec = (op == TOKEN_POW) ? prec : prec + 1;
+        // Recursively parses the right-hand side of a mathematical operation using a dynamic precedence threshold
         Value rhs = parse_expression(next_min_prec);
         if (has_error)
             return lhs;
@@ -437,10 +574,10 @@ Value parse_expression(int min_prec)
                 long long p_res = 1;
                 while (exp > 0)
                 {
-                    if (exp & 1)
+                    if (exp & 1) // If the lowest bit of the exponent is odd, it multiplies the running total (p_res) by the current base.
                         p_res *= base;
-                    base *= base;
-                    exp >>= 1;
+                    base *= base; // Multiplies the base by itself on every loop iteration, squaring it to prep for the next bit position.
+                    exp >>= 1;    // Shifts the exponent's bits right by 1, effectively dividing it by 2 to move to the next power increment until the exponent hits zero.
                 }
                 lhs.i_val = p_res;
             }
@@ -481,7 +618,11 @@ Value parse_expression(int min_prec)
     }
     return lhs;
 }
-// Master File Evaluation Routine
+
+// Master File Evaluation Routine =======
+
+// Previous Claude prompt + Lab4 materials
+
 void read_file(const char *input_path, const char *output_path)
 {
     FILE *fp = fopen(input_path, "r");
@@ -490,20 +631,28 @@ void read_file(const char *input_path, const char *output_path)
         fprintf(stderr, "ERROR: file cannot be opened.\n");
         return;
     }
+
     // Read full file context instantly to perfectly protect arbitrary lengths
     fseek(fp, 0, SEEK_END);
+    // Determine file size
     file_len = ftell(fp);
     fseek(fp, 0, SEEK_SET);
+
+    // Reads contents to a buffer
     char *buf = malloc(file_len + 1);
     long long read_bytes = fread(buf, 1, file_len, fp);
-    buf[read_bytes] = '\0';
+    buf[read_bytes] = '\0'; // end with terminator
     file_len = read_bytes;
+
     fclose(fp);
     file_buf = buf;
+
     global_idx = 0;
     has_error = 0;
+
     current_token = get_next_token();
-    while (current_token.type != TOKEN_EOF && !has_error)
+
+    while (current_token.type != TOKEN_EOF && !has_error) // if no errors
     {
         // Skip blank lines
         if (current_token.type == TOKEN_EOL)
@@ -528,6 +677,7 @@ void read_file(const char *input_path, const char *output_path)
             break;
         }
     }
+
     // Determine final output targets based on execution success state
     FILE *out_fp = fopen(output_path, "w");
     if (!out_fp)
@@ -544,7 +694,7 @@ void read_file(const char *input_path, const char *output_path)
     {
         for (int i = 0; i < output_count; i++)
         {
-            if (recorded_outputs[i].val.type == VAL_INT)
+            if (recorded_outputs[i].val.type == VAL_INT) // Writing evaluated numbers to a file
             {
                 fprintf(out_fp, "%lld\n", recorded_outputs[i].val.i_val);
             }
@@ -554,6 +704,8 @@ void read_file(const char *input_path, const char *output_path)
             }
         }
     }
+
+    // Preventing memory leaks
     fclose(out_fp);
     free(buf);
     free(recorded_outputs);
@@ -574,32 +726,21 @@ void get_base_name(const char *path, char *buffer, int is_dir);
 // Builds the final required naming path structures and tracks processing parameters
 int process_file(const char *input_file, const char *out_dir);
 
-/*
-    EVALUATION LOGIC HEADERS
-*/
 // Source - https://stackoverflow.com/a/66104290
 // Posted by Steve Summit
 // Retrieved 2026-10-22, License - CC BY-SA 4.0
-int evalexpr(const char **); // looks for a series of "terms" being added or subtracted
-int eval(const char *expr);  // takes a string containing an expression, and returns the int result of evaluating it.
-int evalterm(const char **); //
-int gettok(const char **, int *);
-void ungettok(int, const char **);
-int evalpri(const char **p);
-void skipwhite(const char **);
-
-int validate_line(const char *line);
 
 /*
     MAIN FUNCTION
 */
+
 int main(int argc, char *argv[])
 {
     char *dir_path = NULL;
     char *out_dir_arg = NULL;
     char *input_file = NULL;
 
-    if (argc < 2)
+    if (argc < 2) // it's just "calc"
     {
         fprintf(stderr, "ERROR: No arguments provided.\n");
         return 1;
@@ -622,7 +763,7 @@ int main(int argc, char *argv[])
     */
     for (int i = 1; i < argc; i++)
     {
-        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dir") == 0)
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dir") == 0) // input directory handling
         {
             if (i + 1 < argc)
             {
@@ -634,7 +775,7 @@ int main(int argc, char *argv[])
                 return 1;
             }
         }
-        else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output-dir") == 0)
+        else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output-dir") == 0) // output directory handling
         {
             if (i + 1 < argc)
             {
@@ -646,7 +787,7 @@ int main(int argc, char *argv[])
                 return 1;
             }
         }
-        else if (argv[i][0] == '-')
+        else if (argv[i][0] == '-') // things happen
         {
             fprintf(stderr, "ERROR: Unknown option %s.\n", argv[i]);
             return 1;
@@ -655,7 +796,7 @@ int main(int argc, char *argv[])
         {
             if (input_file == NULL)
             {
-                input_file = argv[i];
+                input_file = argv[i]; // default option
             }
             else
             {
@@ -678,21 +819,42 @@ int main(int argc, char *argv[])
     }
 
     // Resolve final destination directory name
-    // 1. Make this larger (2 * MAX_PATH) to account for suffix/formatting overhead
     char final_out_dir[MAX_PATH * 2];
+
+    // Link: https://learnxbyexample.com/c/file-paths/
+    // Learned how to handle file paths: getting, combining and using.
 
     if (out_dir_arg)
     {
-        strncpy(final_out_dir, out_dir_arg, sizeof(final_out_dir) - 1);
-        final_out_dir[sizeof(final_out_dir) - 1] = '\0';
+        // Check if the argument fits entirely without silent truncation
+        if (strlen(out_dir_arg) >= sizeof(final_out_dir))
+        {
+            fprintf(stderr, "Error: Output directory path is too long\n");
+            return 0; // Or appropriate error exit
+        }
+        strcpy(final_out_dir, out_dir_arg);
     }
     else
     {
         char input_base[MAX_PATH];
-        get_base_name(dir_path ? dir_path : input_file, input_base, dir_path ? 1 : 0);
 
-        // 2. This is now 100% safe because final_out_dir is 2048 bytes, while input_base is 1024 bytes.
-        snprintf(final_out_dir, sizeof(final_out_dir), "%s_%s", input_base, STUDENT_SUFFIX);
+        // Ensure the source paths fit within MAX_PATH bounds before extracting base name
+        const char *source_path = dir_path ? dir_path : input_file;
+        if (strlen(source_path) >= sizeof(input_base))
+        {
+            fprintf(stderr, "Error: Input path exceeds maximum allowed length\n");
+            return 0;
+        }
+
+        get_base_name(source_path, input_base, dir_path ? 1 : 0);
+
+        // Explicitly validate that both the base name and suffix fit inside the target buffer
+        int written = snprintf(final_out_dir, sizeof(final_out_dir), "%s_%s", input_base, STUDENT_SUFFIX);
+        if (written < 0 || (size_t)written >= sizeof(final_out_dir))
+        {
+            fprintf(stderr, "Error: Final destination path buffer overflow prevented\n");
+            return 0;
+        }
     }
 
     // Create target output destination folder if not present
@@ -716,7 +878,7 @@ int main(int argc, char *argv[])
             return 1;
         }
     }
-    else if (dir_path)
+    else if (dir_path) // processing all the .txt files if no specific file given
     {
         DIR *dir = opendir(dir_path);
         if (!dir)
@@ -729,11 +891,38 @@ int main(int argc, char *argv[])
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL)
         {
+            has_error = 0;
+
+            // Skip hidden files or exact matches like "." and ".."
+            if (entry->d_name[0] == '.')
+            {
+                continue;
+            }
+
             char *dot = strrchr(entry->d_name, '.');
             if (dot && strcmp(dot, ".txt") == 0)
             {
                 char full_input_path[MAX_PATH * 2];
-                snprintf(full_input_path, sizeof(full_input_path), "%s/%s", dir_path, entry->d_name);
+                int written;
+
+                // Check if dir_path already ends with a slash to avoid duplicate slashes
+                size_t len = strlen(dir_path);
+                if (len > 0 && (dir_path[len - 1] == '/' || dir_path[len - 1] == '\\'))
+                {
+                    written = snprintf(full_input_path, sizeof(full_input_path), "%s%s", dir_path, entry->d_name);
+                }
+                else
+                {
+                    written = snprintf(full_input_path, sizeof(full_input_path), "%s/%s", dir_path, entry->d_name);
+                }
+
+                // Catch path buffer truncation errors instantly
+                if (written < 0 || (size_t)written >= sizeof(full_input_path))
+                {
+                    fprintf(stderr, "Error: Full input path buffer overflow prevented\n");
+                    closedir(dir);
+                    return 1;
+                }
 
                 struct stat entry_stat;
                 if (stat(full_input_path, &entry_stat) == 0 && S_ISREG(entry_stat.st_mode))
@@ -750,137 +939,6 @@ int main(int argc, char *argv[])
     }
 
     return 0;
-}
-
-/*void read_file(char arr[], const FILE *input_file)
-{
-
-    char line[LINE_LEN]; // Use a shared standard buffer size
-
-    FILE *fp = fopen(input_file, "r"); // open the file with writing permissions
-
-    if (fp == NULL)
-    { // throw an error if the file cannot be opened
-        fprintf(stderr, "ERROR: file cannot be opened.\n");
-        return -1; // failure
-    }
-
-    while (fgets(line, sizeof(line), fp) != NULL)
-    {*/
-/* TODO:
-1. Check a line for ambigous characters
-2. Evaluate the line
-3. Write the result to an output file
-*/
-/*if (validate_line(line) != 0)
-{
-    // TODO: write ERROR:5 to the file.
-    fprintf(stderr, "ERROR: invalid character.\n");
-    return -1;
-}
-eval(line);
-}
-}*/
-
-/*
-    EVALUATION LOGIC
-*/
-
-int evalexpr(const char **p)
-{
-    int r = evalterm(p);
-    while (1)
-    {
-        int op = gettok(p, NULL);
-        switch (op)
-        {
-        case '+':
-            r += evalterm(p);
-            break;
-        case '-':
-            r -= evalterm(p);
-            break;
-        default:
-            ungettok(op, p);
-            return r;
-        }
-    }
-}
-
-int evalterm(const char **p)
-{
-    int r = evalpri(p);
-    while (1)
-    {
-        int op = gettok(p, NULL);
-        switch (op)
-        {
-        case '*':
-            r *= evalpri(p);
-            break;
-        case '/':
-            r /= evalpri(p);
-            break;
-        default:
-            ungettok(op, p);
-            return r;
-        }
-    }
-}
-
-int evalpri(const char **p)
-{
-    int v;
-    int op = gettok(p, &v);
-    switch (op)
-    {
-    case '1':
-        return v;
-    case '-':
-        return -evalpri(p);
-    case '(':
-        v = evalexpr(p);
-        op = gettok(p, NULL);
-        if (op != ')')
-        {
-            fprintf(stderr, "missing ')'\n");
-            ungettok(op, p);
-        }
-        return v;
-    }
-}
-
-int gettok(const char **p, int *vp)
-{
-    skipwhite(p);
-    char c = **p;
-    if (isdigit(c))
-    {
-        char *p2;
-        int v = strtoul(*p, &p2, 0);
-        *p = p2;
-        if (vp)
-            *vp = v;
-        return '1';
-    }
-    (*p)++;
-    return c;
-}
-
-void skipwhite(const char **p)
-{
-    while (isspace(**p))
-        (*p)++;
-}
-
-void ungettok(int op, const char **p)
-{
-    (*p)--;
-}
-
-int eval(const char *expr) // takes a string containing an expression, and returns the int result of evaluating it.
-{
-    return evalexpr(&expr);
 }
 
 /*
@@ -929,100 +987,19 @@ void get_base_name(const char *path, char *buffer, int is_dir)
     }
 }
 
+// Coordinates the end-to-end translation pipeline for a single file
+// by resolving its output destination, initiating parsing, and verifying execution errors
 int process_file(const char *input_file, const char *out_dir)
 {
     char base_name[MAX_PATH];
     get_base_name(input_file, base_name, 0);
 
-    // 1. Construct the exact output target filepath
+    // Construct the exact output target filepath
     char out_file_path[MAX_PATH * 2];
     snprintf(out_file_path, sizeof(out_file_path), "%s/%s_%s.txt", out_dir, base_name, STUDENT_FULL_SUFFIX);
 
-    // 2. Delegate the core engine execution pass to your transaction-buffered parser
-    // This systematically processes math lines and enforces the "all-or-nothing" rule
+    // Evaluating the file
     read_file(input_file, out_file_path);
 
-    // 3. AddressSanitizer/grading check tracking
-    // If the parser tripped a critical evaluation error, exit with -1 to halt batch processes
-    if (has_error)
-    {
-        // The error structure has already printed its string coordinates to out_file_path cleanly.
-        // Return 1 or -1 here depending on whether your main requires a full pipeline break.
-        return 1;
-    }
-
-    return 0;
-}
-
-/*
-    ----
-*/
-
-// AI (Claude Haiku 4.5): prompt "how to efficiently check if a char is arithmetic (0-9, +, -, /, *) in C? Intermediate user is trying to validate expressions from a file, on success, write an answer to that expression and on error, write an error code to another file."
-// Link: https://duck.ai/share/17adb4cc-e97d-4d85-a6e3-680497212a24#ZFlq4VX5J11Gp2hJt1vgEDlLn70pIZKZpAHHL-KmA0s
-//   Took the line validation loop.
-
-// Helper to separate numbers from operators
-bool is_operator(char c)
-{
-    return (c == '+' || c == '-' || c == '*' || c == '/');
-}
-
-int validate_line(const char *line)
-{
-    bool expecting_number = true; // True if we need a number next, false if we expect an operator
-    bool found_any_content = false;
-
-    for (int i = 0; line[i] != '\0'; i++)
-    {
-        char c = line[i];
-
-        // skip spaces but don't break the structural logic
-        if (isspace((unsigned char)c))
-        {
-            continue;
-        }
-
-        // enforce allowed characters
-        if (!isdigit((unsigned char)c) && !is_operator(c))
-        {
-            // TODO: Write error codes to the files
-            return -1; // Invalid character found
-        }
-
-        found_any_content = true;
-
-        // Structural Syntax Check
-        if (isdigit((unsigned char)c))
-        {
-            if (!expecting_number)
-            {
-                // Caught something like "5 6" (two adjacent numbers separated by space)
-                return -2; // Structural Error: Missing operator
-            }
-            // Skip the rest of this multi-digit number so '4' and '2' in "42" are not treated as separate things
-            while (isdigit((unsigned char)line[i + 1]))
-            {
-                i++;
-            }
-            expecting_number = false; // Next, we must see an operator
-        }
-        else if (is_operator(c))
-        {
-            if (expecting_number)
-            {
-                // Caught something like "+ 5" or "5 * + 3"
-                return -3; // Structural Error: Missing operand / double operator
-            }
-            expecting_number = true; // Next, we must see a number
-        }
-    }
-
-    // A valid line cannot end on an operator
-    if (!found_any_content || expecting_number)
-    {
-        return -4; // Structural Error: Ends with trailing operator or line is empty
-    }
-
-    return 0; // Completely valid arithmetic syntax
+    return 0; // Here we go!
 }
